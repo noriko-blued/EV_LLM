@@ -1,0 +1,60 @@
+{
+  "name": "autofiller",
+  "version": "2.0.0",
+  "description": "Autofiller - Electron + Playwright desktop app for school registration autofill",
+  "author": "Noriko Chitose",
+  "license": "MIT",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "NODE_ENV=development electron .",
+    "build": "electron-builder",
+    "dist": "electron-builder"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "pdf-parse": "^1.1.1",
+    "playwright": "^1.43.1"
+  },
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.blued.autofiller",
+    "productName": "Autofiller",
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "automations/**/*",
+      "package.json",
+      ".env.example"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/",
+        "to": "resources",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "artifactName": "Autofiller-${version}-mac.${ext}"
+    },
+    "directories": {
+      "buildResources": "build",
+      "output": "dist"
+    }
+  }
+}
