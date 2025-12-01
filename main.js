@@ -4,6 +4,7 @@ const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const { chromium } = require('playwright-core');
 const pdfParse = require('pdf-parse');
 const { randomUUID } = require('crypto');
+const { extractDataFromText } = require('./llm_client');
 require('dotenv').config();
 
 const automations = {
@@ -146,7 +147,17 @@ ipcMain.handle('start-automation', async (event, payload) => {
 
   (async () => {
     try {
-      await automation.run({ page, pdfText, pdfPath, log, env: process.env });
+      // LLMによるデータ抽出
+      let llmData = null;
+      try {
+        sendLog(jobId, 'LLMでデータを解析中...', event.sender);
+        llmData = await extractDataFromText(pdfText);
+        sendLog(jobId, 'LLM解析完了', event.sender);
+      } catch (llmError) {
+        sendLog(jobId, `LLM解析エラー (続行します): ${llmError.message}`, event.sender);
+      }
+
+      await automation.run({ page, pdfText, pdfPath, log, env: process.env, llmData });
       sendJobStatus(jobId, { status: 'done' }, event.sender);
       sendLog(jobId, '自動入力が完了しました', event.sender);
     } catch (err) {

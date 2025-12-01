@@ -1,6 +1,6 @@
 const path = require("path");
 
-const run = async ({ page, pdfText, log, env }) => {
+const run = async ({ page, pdfText, log, env, llmData }) => {
     const LOGIN_URL = env.EV_LOGIN_URL || "https://www.evenglish.com/user-account/login";
     const FORM_URL = env.EV_FORM_URL || "https://www.evenglish.com/SECURE/index?device=desktop&hideForgotPassword=Y&logoPath=%2Fimages%2Fschool%2Flogo.png&logoMobilePath=%2Fimages%2Fschool%2Fev_small_logo.png&showImage=https%3A%2F%2Fwww.evenglish.com%2Fimages%2Fschool%2Fev_small_logo.png&favIcon=https%3A%2F%2Fwww.evenglish.com%2Fimages%2Fschool%2Fev_small_logo.png";
     const DEFAULT_TIMEOUT = 45000;
@@ -624,8 +624,17 @@ const run = async ({ page, pdfText, log, env }) => {
 
     // --- Execution Logic ---
 
-    const pdfValues = loadPdfValues(pdfText);
-    log(`📄 PDF から抽出: ${JSON.stringify(pdfValues, null, 2)}`);
+    let pdfValues;
+    if (llmData) {
+        log(`🤖 LLMデータを使用します: ${JSON.stringify(llmData, null, 2)}`);
+        pdfValues = llmData;
+    } else {
+        // Fallback to regex-based parsing if LLM fails
+        log(`⚠️ LLMデータがないため、正規表現でパースします`);
+        pdfValues = loadPdfValues(pdfText);
+    }
+
+    log(`📄 最終抽出データ: ${JSON.stringify(pdfValues, null, 2)}`);
     log(`Courses found: ${JSON.stringify(pdfValues.courses, null, 2)}`);
 
     if (isMeaningfulRemark(pdfValues.remarks)) {
