@@ -12,3 +12,4 @@ dist
 *.blockmap
 out
 release
+.env
