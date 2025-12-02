@@ -110,41 +110,132 @@ const run = async ({ page, pdfText, log, env, llmData }) => {
         return m ? m[1] : "";
     };
 
+    const summarizeRemarks = (text) => {
+        if (!text) return "";
+
+        const fields = {
+            "アレルギー項目": null,
+            "発症の程度": null,
+            "通院の頻度": null,
+            "症状": null,
+            "処置方法": null
+        };
+
+        // Extract each field using regex
+        let foundStructuredData = false;
+        for (const [label, _] of Object.entries(fields)) {
+            // Match pattern: ・アレルギー項目：value or アレルギー項目：value
+            const pattern = new RegExp(`[・]?${label}[：:](.*?)(?=[・]|$)`, 's');
+            const match = text.match(pattern);
+            if (match && match[1]) {
+                const value = match[1].trim();
+                // Skip if value is "なし" or empty
+                if (value && value !== "なし" && value !== "無し") {
+                    fields[label] = value;
+                    foundStructuredData = true;
+                }
+            }
+        }
+
+        // If we found structured data, build summary with only non-null fields
+        if (foundStructuredData) {
+            const summary = [];
+            for (const [label, value] of Object.entries(fields)) {
+                if (value !== null) {
+                    summary.push(`${label}: ${value}`);
+                }
+            }
+            return summary.join("\n");
+        }
+
+        // If no structured data found, clean up and return the original text
+        // Remove common headers and questions
+        let cleaned = text
+            .replace(/アレルギー\/持病情報/g, '')
+            .replace(/●.*?→.*?(?=<|$)/gs, '') // Remove questions like "●食べ物アレルギーはありますか？ →ある"
+            .replace(/<アレルギーがある場合>/g, '')
+            .replace(/\*変動の可能性はございます/g, '')
+            .trim();
+
+        return cleaned || "";
+    };
+
+
+
     const translateJapaneseToEnglish = async (context, text) => {
         if (!text) return "";
-        const page = await context.newPage();
-        try {
-            const encoded = encodeURIComponent(text);
-            const url = `https://www.deepl.com/translator#ja/en/${encoded}`;
-            await page.goto(url, { waitUntil: "domcontentloaded" });
 
-            const targetContainer = "d-textarea[data-testid='translator-target-input']";
-            const contentSelector = `${targetContainer} div[contenteditable='true']`;
+        // Split by newlines and translate each line separately to preserve structure
+        const lines = text.split('\n').filter(line => line.trim());
+        if (lines.length === 0) return "";
 
+        const translatedLines = [];
+
+        for (const line of lines) {
+            const page = await context.newPage();
             try {
-                await page.waitForSelector(contentSelector, { timeout: 10000 });
+                const encoded = encodeURIComponent(line);
+                const url = `https://www.deepl.com/translator#ja/en/${encoded}`;
+                await page.goto(url, { waitUntil: "domcontentloaded" });
+
+                const targetContainer = "d-textarea[data-testid='translator-target-input']";
+                const contentSelector = `${targetContainer} div[contenteditable='true']`;
+
+                try {
+                    await page.waitForSelector(contentSelector, { timeout: 10000 });
+                } catch (e) {
+                    log("DeepL target container not found.");
+                    throw e;
+                }
+
+                // Wait for initial translation to appear
+                await page.waitForFunction(
+                    (selector) => {
+                        const el = document.querySelector(selector);
+                        return el && el.innerText.trim().length > 0;
+                    },
+                    contentSelector,
+                    { timeout: 30000 }
+                );
+
+                // Wait for translation to stabilize (no changes for 2 seconds for shorter texts)
+                let previousText = "";
+                let stableCount = 0;
+                const maxAttempts = 10;
+
+                for (let i = 0; i < maxAttempts; i++) {
+                    const currentText = await page.$eval(contentSelector, el => el.innerText.trim());
+
+                    if (currentText === previousText && currentText.length > 0) {
+                        stableCount++;
+                        if (stableCount >= 2) {
+                            translatedLines.push(currentText);
+                            break;
+                        }
+                    } else {
+                        stableCount = 0;
+                    }
+
+                    previousText = currentText;
+                    await page.waitForTimeout(1000);
+                }
+
+                // If loop completed without breaking, use the last result
+                if (stableCount < 2) {
+                    const result = await page.$eval(contentSelector, el => el.innerText.trim());
+                    translatedLines.push(result);
+                }
             } catch (e) {
-                log("DeepL target container not found.");
-                throw e;
+                log(`DeepL Translation failed for line "${line}": ${e.message}`);
+                translatedLines.push(line); // Use original if translation fails
+            } finally {
+                await page.close();
             }
-
-            await page.waitForFunction(
-                (selector) => {
-                    const el = document.querySelector(selector);
-                    return el && el.innerText.trim().length > 0;
-                },
-                contentSelector,
-                { timeout: 20000 }
-            );
-
-            const result = await page.$eval(contentSelector, el => el.innerText);
-            return result;
-        } catch (e) {
-            log(`DeepL Translation failed: ${e.message}`);
-            return text;
-        } finally {
-            await page.close();
         }
+
+        const finalResult = translatedLines.join('\n');
+        log(`✅ DeepL translation complete: "${finalResult.substring(0, 100)}..."`);
+        return finalResult;
     };
 
     const loadPdfValues = (pdfText) => {
@@ -514,38 +605,108 @@ const run = async ({ page, pdfText, log, env, llmData }) => {
         const popup = page.locator('.z-datebox-popup:visible').last();
         await popup.waitFor({ state: 'visible', timeout: 5000 });
 
-        for (let i = 0; i < 24; i++) {
+        for (let i = 0; i < 60; i++) {
             const titleText = await popup.locator('.z-calendar-title').textContent();
-            const currentViewDate = new Date(titleText);
+            log(`  📅 Calendar title: "${titleText}"`);
+
+            // Parse calendar title - it might be in format like "May 2026" or "2026年5月"
+            let currentYear, currentMonth;
+
+            // Try English format first (e.g., "May 2026" or "Dec 2026")
+            const englishMatch = titleText.match(/([A-Za-z]+)\s+(\d{4})/);
+            if (englishMatch) {
+                const monthNames = {
+                    "january": 0, "jan": 0,
+                    "february": 1, "feb": 1,
+                    "march": 2, "mar": 2,
+                    "april": 3, "apr": 3,
+                    "may": 4,
+                    "june": 5, "jun": 5,
+                    "july": 6, "jul": 6,
+                    "august": 7, "aug": 7,
+                    "september": 8, "sep": 8, "sept": 8,
+                    "october": 9, "oct": 9,
+                    "november": 10, "nov": 10,
+                    "december": 11, "dec": 11
+                };
+                const monthStr = englishMatch[1].toLowerCase();
+                currentMonth = monthNames[monthStr];
+                if (currentMonth === undefined) {
+                    log(`⚠️ Unknown month name: "${englishMatch[1]}"`);
+                    currentMonth = 0;
+                }
+                currentYear = parseInt(englishMatch[2]);
+            } else {
+                // Try Japanese format (e.g., "2026年5月")
+                const japaneseMatch = titleText.match(/(\d{4})年(\d{1,2})月/);
+                if (japaneseMatch) {
+                    currentYear = parseInt(japaneseMatch[1]);
+                    currentMonth = parseInt(japaneseMatch[2]) - 1; // 0-indexed
+                } else {
+                    // Fallback: try to parse as date
+                    const parsed = new Date(titleText);
+                    if (!isNaN(parsed.getTime())) {
+                        currentYear = parsed.getFullYear();
+                        currentMonth = parsed.getMonth();
+                    } else {
+                        log(`⚠️ Could not parse calendar title: "${titleText}"`);
+                        break;
+                    }
+                }
+            }
+
             const targetYear = dateObj.getFullYear();
             const targetMonth = dateObj.getMonth();
-            const currentYear = currentViewDate.getFullYear();
-            const currentMonth = currentViewDate.getMonth();
+
+            log(`  Current: ${currentYear}/${currentMonth + 1}, Target: ${targetYear}/${targetMonth + 1}`);
 
             if (targetYear === currentYear && targetMonth === currentMonth) {
+                log(`  ✅ Reached target month`);
                 break;
             }
 
             if (targetYear < currentYear || (targetYear === currentYear && targetMonth < currentMonth)) {
+                log(`  ⬅️ Clicking left arrow to go back`);
                 await popup.locator('.z-calendar-left').click();
             } else {
+                log(`  ➡️ Clicking right arrow to go forward`);
                 await popup.locator('.z-calendar-right').click();
             }
             await page.waitForTimeout(300);
         }
 
+        // Wait for calendar to fully render after navigation
+        await page.waitForTimeout(500);
+        log(`  🔍 Looking for day ${dateObj.getDate()}...`);
+
         const day = dateObj.getDate();
         const dayCells = popup.locator('.z-calendar-cell');
         const cellCount = await dayCells.count();
+        log(`  Found ${cellCount} calendar cells`);
 
         for (let i = 0; i < cellCount; i++) {
             const cell = dayCells.nth(i);
             const text = await cell.textContent();
+            const classAttribute = await cell.getAttribute('class') || "";
+
+            // Skip cells that are not for the current month or are disabled
+            if (classAttribute.includes('z-calendar-outside') || classAttribute.includes('z-calendar-disabled')) {
+                continue;
+            }
+
             if (text.trim() === String(day)) {
-                await cell.click();
-                break;
+                log(`  ✓ Found matching cell: text="${text.trim()}", class="${classAttribute}"`);
+                try {
+                    await cell.click();
+                    log(`   Clicked day ${day}`);
+                    break;
+                } catch (clickError) {
+                    log(`  ⚠️ Click failed: ${clickError.message}`);
+                }
             }
         }
+
+        log(`  📅 Finished searching for day ${day}`);
 
         await page.waitForTimeout(1000);
         await popup.waitFor({ state: 'hidden', timeout: 2000 }).catch(async () => {
@@ -624,6 +785,10 @@ const run = async ({ page, pdfText, log, env, llmData }) => {
 
     // --- Execution Logic ---
 
+    // Debug: Log raw PDF text to troubleshoot extraction issues
+    log(`📝 PDFテキスト（最初の500文字）: ${pdfText.substring(0, 500)}`);
+    log(`📝 PDFテキスト（最後の500文字）: ${pdfText.substring(Math.max(0, pdfText.length - 500))}`);
+
     let pdfValues;
     if (llmData) {
         log(`🤖 LLMデータを使用します: ${JSON.stringify(llmData, null, 2)}`);
@@ -637,12 +802,24 @@ const run = async ({ page, pdfText, log, env, llmData }) => {
     log(`📄 最終抽出データ: ${JSON.stringify(pdfValues, null, 2)}`);
     log(`Courses found: ${JSON.stringify(pdfValues.courses, null, 2)}`);
 
+    // Translate remarks only if meaningful (contains allergy/medical info, not just "なし")
+    let translatedRemarks = "";
     if (isMeaningfulRemark(pdfValues.remarks)) {
-        log(`🌐 備考を翻訳中: ${pdfValues.remarks}`);
-        pdfValues.remarks = await translateJapaneseToEnglish(page.context(), pdfValues.remarks);
-        log(`✅ 翻訳結果: ${pdfValues.remarks}`);
+        log(`📋 元の備考: ${pdfValues.remarks}`);
+
+        // Summarize to extract only key fields
+        const summarized = summarizeRemarks(pdfValues.remarks);
+
+        if (summarized) {
+            log(`📝 要約された備考: ${summarized}`);
+            log(`🌐 備考を翻訳中...`);
+            translatedRemarks = await translateJapaneseToEnglish(page.context(), summarized);
+            log(`✅ 翻訳結果: ${translatedRemarks}`);
+        } else {
+            log(`ℹ️ 備考に有効な情報が見つかりませんでした`);
+        }
     } else {
-        pdfValues.remarks = "";
+        log(`ℹ️ 備考は空または「なし」のため翻訳をスキップします`);
     }
 
     page.setDefaultTimeout(DEFAULT_TIMEOUT);
@@ -709,15 +886,59 @@ const run = async ({ page, pdfText, log, env, llmData }) => {
         const row = courseRows.nth(i);
 
         let curriculum = c.course;
-        let spartaType = "";
-        const match = c.course.match(/^(.*?)\s*\((.*?)\)$/);
-        if (match) {
-            curriculum = match[1].trim();
-            spartaType = match[2].trim();
+        let spartaType = c.spartaType || "";
+
+        if (!spartaType) {
+            const match = c.course.match(/^(.*?)\s*\((.*?)\)$/);
+            if (match) {
+                curriculum = match[1].trim();
+                spartaType = match[2].trim();
+            }
+        }
+
+        // Validate Course and Sparta/Semi-Sparta combination
+        const validCourses = {
+            "Sparta": [
+                "Intensive ESL",
+                "IELTS Guarantee",
+                "IELTS",
+                "TOEIC",
+                "Business",
+                "Digital English",
+                "Power Speaking 6",
+                "Power Speaking 8"
+            ],
+            "Semi-Sparta": [
+                "ESL Classic",
+                "TOEIC",
+                "Business",
+                "Digital English",
+                "Power Speaking 6",
+                "Power Speaking 8"
+            ]
+        };
+
+        const mappedSpartaType = mapSpartaType(spartaType); // Normalize to "Sparta" or "Semi-Sparta"
+        const allowedCourses = validCourses[mappedSpartaType] || [];
+
+        // Check if the current curriculum exists in the allowed list for the selected type
+        // We use a case-insensitive check to be safe
+        const matchedCourse = allowedCourses.find(ac => ac.toLowerCase() === curriculum.toLowerCase());
+
+        if (!matchedCourse) {
+            log(`⚠️ 該当のコースが見当たりません: ${curriculum} (${mappedSpartaType})`);
+            // Fallback: try to find it in the other list to see if type was wrong, or just proceed
+            const otherType = mappedSpartaType === "Sparta" ? "Semi-Sparta" : "Sparta";
+            if (validCourses[otherType].find(ac => ac.toLowerCase() === curriculum.toLowerCase())) {
+                log(`   (ヒント: ${curriculum} は ${otherType} に存在します)`);
+            }
+        } else {
+            // Use the canonical name from the list to ensure UI matching
+            curriculum = matchedCourse;
         }
 
         const campusValue = "Main";
-        const spartaValue = mapSpartaType(spartaType);
+        const spartaValue = mappedSpartaType;
         const periodValue = mapPeriodValue(c.period);
 
         log(`  Campus: ${campusValue}, Sparta: ${spartaValue}, Curriculum: ${curriculum}, Period: ${periodValue}`);
@@ -751,10 +972,17 @@ const run = async ({ page, pdfText, log, env, llmData }) => {
             const startDateObj = parseDateLikeJp(nearestSunday);
             if (startDateObj) {
                 log(`  Selecting Course ${i + 1} Start Date (nearest Sunday to ${courseStartDate}): ${nearestSunday}`);
-                const dateBtn = row.locator('.z-datebox-button').first();
-                await dateBtn.click();
-                await selectDateFromCalendar(page, startDateObj);
-                previousCourseStartDate = nearestSunday;
+                try {
+                    const dateBtn = row.locator('.z-datebox-button').first();
+                    log(`  📅 Clicking date button...`);
+                    await dateBtn.click();
+                    await page.waitForTimeout(1000); // Wait for calendar to appear
+                    log(`  📅 Calling selectDateFromCalendar...`);
+                    await selectDateFromCalendar(page, startDateObj);
+                    previousCourseStartDate = nearestSunday;
+                } catch (dateError) {
+                    log(`⚠️ Date selection error for Course ${i + 1}: ${dateError.message}`);
+                }
             }
         }
     }
@@ -804,6 +1032,19 @@ const run = async ({ page, pdfText, log, env, llmData }) => {
                 const dateBtn = dormRow.locator('.z-datebox-button').first();
                 await dateBtn.click();
                 await selectDateFromCalendar(page, dormDateObj);
+            }
+        }
+
+        // Add translated remarks to Dormitory Special Request Note if meaningful
+        if (translatedRemarks) {
+            try {
+                // Find textarea by placeholder attribute
+                const noteTextarea = page.locator('textarea[placeholder*="Dormitory Special Request Note"]');
+                await noteTextarea.waitFor({ timeout: 3000 });
+                await noteTextarea.fill(translatedRemarks);
+                log(`✅ Dormitory Special Request Noteに備考を入力: ${translatedRemarks}`);
+            } catch (noteError) {
+                log(`⚠️ Dormitory Special Request Note入力エラー: ${noteError.message}`);
             }
         }
 

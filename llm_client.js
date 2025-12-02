@@ -64,6 +64,16 @@ Please extract the following fields and format them as a valid JSON object.
 If a field is not found, use an empty string "" or null.
 For dates, try to standardize to YYYY/MM/DD format if possible.
 
+Parsing Rules:
+1. For the "holidays" field: Extract only the dates listed after "期間内の祝日". Ignore the annotation "*変動の可能性はございます".
+2. For the "remarks" field: This field contains allergy and medical information. Look for content after the "備考" label, which may include:
+   - "アレルギー/持病情報" section
+   - Food allergy details (アレルギー項目, 発症の程度, 症状, etc.)
+   - Medical conditions
+   Extract ALL this information as a single string. If the section only says "なし" or "特になし" or is empty, use "".
+3. Ignore lines starting with "*" (asterisk) like "*変動の可能性はございます" - these are notes, not field values.
+4. If a label is followed immediately by another label with no content in between, the value for the first label is empty.
+
 Required JSON Structure:
 ${JSON.stringify(DATA_SCHEMA, null, 2)}
 
